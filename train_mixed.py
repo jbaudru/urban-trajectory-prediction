@@ -16,7 +16,6 @@ from train import (
     TRAIN_GNN,
     TRAIN_LSTM,
     TRAIN_TRANSFORMER,
-    TRAIN_GRAPHIDYOM,
     K_FOLDS,
     USE_KFOLD,
 )
@@ -99,7 +98,7 @@ class MixedTrajectoryPredictor(TrajectoryPredictor):
 
 def main():
     parser = argparse.ArgumentParser(description="Train trajectory models on mixed CI/CO/CL data")
-    parser.add_argument("--model", type=str, choices=["lstm", "transformer", "gnn", "graphidyom", "all"], default="all",
+    parser.add_argument("--model", type=str, choices=["lstm", "transformer", "gnn", "all"], default="all",
                         help="Model type to train (default: all)")
 
     parser.add_argument("--data-ci-path", type=str, default="data/subnet_ci.csv",
@@ -128,8 +127,6 @@ def main():
                         help="Disable K-Fold cross-validation")
     parser.add_argument("--k-folds", type=int, default=None,
                         help=f"Number of folds for K-Fold CV (default: {K_FOLDS})")
-    parser.add_argument("--graphidyom-order", type=int, default=7,
-                        help="Markov order for GraphIDyOM model (default: 7)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for balanced mixing and shuffling")
 
@@ -172,7 +169,6 @@ def main():
         print(f"  TRAIN_LSTM: {TRAIN_LSTM}")
         print(f"  TRAIN_TRANSFORMER: {TRAIN_TRANSFORMER}")
         print(f"  TRAIN_GNN: {TRAIN_GNN}")
-        print(f"  TRAIN_GRAPHIDYOM: {TRAIN_GRAPHIDYOM}")
         print(f"  USE_KFOLD: {use_kfold}")
         if use_kfold:
             print(f"  K_FOLDS: {k_folds}")
@@ -181,10 +177,8 @@ def main():
             train_lstm=TRAIN_LSTM,
             train_transformer=TRAIN_TRANSFORMER,
             train_gnn=TRAIN_GNN,
-            train_graphidyom=TRAIN_GRAPHIDYOM,
             use_kfold=use_kfold,
             k_folds=k_folds,
-            graphidyom_order=args.graphidyom_order,
         )
 
         if results:
@@ -215,11 +209,6 @@ def main():
                 "epochs": args.epochs,
                 "learning_rate": args.learning_rate,
             },
-            "graphidyom": {
-                "batch_size": args.batch_size,
-                "epochs": args.epochs,
-                "learning_rate": args.learning_rate,
-            },
         }
         config = model_configs[args.model]
 
@@ -227,7 +216,6 @@ def main():
             _, model, aggregated_metrics = predictor.train_model_kfold(
                 model_type=args.model,
                 k_folds=k_folds,
-                graphidyom_order=args.graphidyom_order,
                 **config,
             )
             full_path_results = predictor.evaluate_full_path(model, args.model, num_samples=100)
@@ -238,7 +226,6 @@ def main():
         else:
             model, train_losses, val_losses, val_accuracies = predictor.train_model(
                 model_type=args.model,
-                graphidyom_order=args.graphidyom_order,
                 **config,
             )
             accuracy, _, _ = predictor.evaluate_model(model, args.model)
