@@ -23,18 +23,17 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import models from separate files
-from models import (
-    LSTMTrajectoryPredictor,
-    TransformerTrajectoryPredictor,
-    GNNTrajectoryPredictor,
-)
+from models import (LSTMTrajectoryPredictor, TransformerTrajectoryPredictor, 
+                    GNNTrajectoryPredictor, GraphIDyOMPredictor)
+from models.graph_idyom import build_graph_structure_from_sequences
 
 # =============================================================================
 # GLOBAL CONFIGURATION - Set which models to train
 # =============================================================================
-TRAIN_LSTM = True
-TRAIN_TRANSFORMER = True
-TRAIN_GNN = True
+TRAIN_LSTM = False
+TRAIN_TRANSFORMER = False
+TRAIN_GNN = False
+TRAIN_GRAPHIDYOM = True
 
 # K-Fold Cross-Validation Configuration
 K_FOLDS = 5  # Number of folds for cross-validation
@@ -64,7 +63,14 @@ class TrajectoryDataset(Dataset):
 
 
 class TrajectoryPredictor:
-    """Main class for training and evaluating trajectory prediction models."""
+    """Main class for training and evaluating trajectory prediction models
+    
+    IMPORTANT: For GraphIDyOM training, use GPU-optimized graph structure building:
+    - Use: graph_struct = build_graph_structure_from_sequences(sequences, predictor.vocab_size)
+    - Or: graph_struct = predictor.build_graph_structure(sequences)  # sequences should be on GPU
+    - Do NOT convert to CPU/numpy before building graph structure
+    - The new implementation is fully vectorized and GPU-accelerated
+    """
     
     def __init__(self, data_path, graph_path, sequence_length=10, test_size=0.2, val_size=0.2):
         self.data_path = data_path
@@ -235,23 +241,62 @@ class TrajectoryPredictor:
         print(f"Node vocabulary size: {self.vocab_size}")
         print(f"Edge index range: [{self.edge_index.min().item()}, {self.edge_index.max().item()}]")
     
-    def create_model(self, model_type):
-        """Create a model instance based on type."""
+    def build_graph_structure(self, sequences):
+        """
+        Build graph structure for GraphIDyOM from sequences (GPU-optimized).
+        
+        Args:
+            sequences: torch.Tensor of shape (N, seq_len) with node indices on GPU
+            
+        Returns:
+            dict with keys: 'adjacency', 'edge_weights', 'in_degrees', 'out_degrees'
+        """
+        # Ensure sequences are on the correct device
+        if isinstance(sequences, np.ndarray):
+            sequences = torch.tensor(sequences, dtype=torch.long, device=self.device)
+        else:
+            sequences = sequences.to(self.device)
+        
+        # Build graph structure directly on GPU (fully vectorized, no CPU conversion)
+        graph_struct = build_graph_structure_from_sequences(sequences, self.vocab_size)
+        
+        return graph_struct
+    
+    def create_model(self, model_type, graphidyom_order=2):
+        """Create a model instance based on type
+        
+        Args:
+            model_type: Type of model to create
+            graphidyom_order: Markov order for GraphIDyOM (default: 2)
+        """
         if model_type == 'lstm':
             return LSTMTrajectoryPredictor(self.vocab_size)
         elif model_type == 'transformer':
             return TransformerTrajectoryPredictor(self.vocab_size)
         elif model_type == 'gnn':
             return GNNTrajectoryPredictor(self.vocab_size)
+        elif model_type == 'graphidyom':
+            return GraphIDyOMPredictor(
+                vocab_size=self.vocab_size,
+                embedding_dim=64,
+                max_order=graphidyom_order,
+                use_neural_weighting=True
+            )
         else:
             raise ValueError(f"Unknown model type: {model_type}")
     
-    def train_model(self, model_type='lstm', batch_size=64, epochs=50, learning_rate=0.001):
-        """Train a specific model."""
+    def train_model(self, model_type='lstm', batch_size=64, epochs=50, learning_rate=0.001, graphidyom_order=2):
+        """Train a specific model
+        
+        Args:
+            graphidyom_order: Markov order for GraphIDyOM (default: 2)
+        """
         print(f"\nTraining {model_type.upper()} model...")
+        if model_type == 'graphidyom':
+            print(f"  GraphIDyOM Markov order: {graphidyom_order}")
         
         # Create model
-        model = self.create_model(model_type)
+        model = self.create_model(model_type, graphidyom_order=graphidyom_order)
         model = model.to(self.device)
         
         # Create data loaders
@@ -429,7 +474,7 @@ class TrajectoryPredictor:
         
         return accuracy, all_predictions, all_targets
     
-    def train_model_kfold(self, model_type='lstm', batch_size=64, epochs=50, learning_rate=0.001, k_folds=5):
+    def train_model_kfold(self, model_type='lstm', batch_size=64, epochs=50, learning_rate=0.001, k_folds=5, graphidyom_order=2):
         """
         Train a model using K-Fold cross-validation for robust evaluation.
         
@@ -439,6 +484,7 @@ class TrajectoryPredictor:
             epochs: Number of training epochs
             learning_rate: Learning rate
             k_folds: Number of folds for cross-validation
+            graphidyom_order: Markov order for GraphIDyOM (default: 2)
         
         Returns:
             fold_results: List of results for each fold
@@ -447,6 +493,8 @@ class TrajectoryPredictor:
         """
         print(f"\n{'='*60}")
         print(f"Training {model_type.upper()} with {k_folds}-Fold Cross-Validation")
+        if model_type == 'graphidyom':
+            print(f"GraphIDyOM Markov order: {graphidyom_order}")
         print(f"{'='*60}")
         
         # Get all sequences and targets
@@ -486,8 +534,14 @@ class TrajectoryPredictor:
             print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
             
             # Create model
-            model = self.create_model(model_type)
+            model = self.create_model(model_type, graphidyom_order=graphidyom_order)
             model = model.to(self.device)
+            
+            # Build graph structure for GraphIDyOM (only once per fold)
+            graph_structure = None
+            if model_type == 'graphidyom':
+                print(f"  Building graph structure for GraphIDyOM from training data...")
+                graph_structure = self.build_graph_structure(all_sequences[train_idx])
             
             # Create data loaders
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -523,6 +577,8 @@ class TrajectoryPredictor:
                     if model_type == 'gnn':
                         edge_index = self.edge_index.to(self.device)
                         outputs = model(batch_sequences, edge_index)
+                    elif model_type == 'graphidyom':
+                        outputs = model(batch_sequences, graph_structure=graph_structure)
                     else:
                         outputs = model(batch_sequences)
                     
@@ -547,6 +603,8 @@ class TrajectoryPredictor:
                         if model_type == 'gnn':
                             edge_index = self.edge_index.to(self.device)
                             outputs = model(batch_sequences, edge_index)
+                        elif model_type == 'graphidyom':
+                            outputs = model(batch_sequences, graph_structure=graph_structure)
                         else:
                             outputs = model(batch_sequences)
                         
@@ -605,6 +663,8 @@ class TrajectoryPredictor:
                     if model_type == 'gnn':
                         edge_index = self.edge_index.to(self.device)
                         outputs = model(batch_sequences, edge_index)
+                    elif model_type == 'graphidyom':
+                        outputs = model(batch_sequences, graph_structure=graph_structure)
                     else:
                         outputs = model(batch_sequences)
                     
@@ -1042,9 +1102,13 @@ class TrajectoryPredictor:
         
         return list(decoded_path), reached_destination
     
-    def compare_models(self, train_lstm=True, train_transformer=True, train_gnn=True,
-                       use_kfold=False, k_folds=5):
-        """Train and compare selected models, optionally using K-Fold cross-validation."""
+    def compare_models(self, train_lstm=True, train_transformer=True, train_gnn=True, 
+                       train_graphidyom=True, use_kfold=False, k_folds=5, graphidyom_order=7):
+        """Train and compare selected models, optionally using K-Fold cross-validation
+        
+        Args:
+            graphidyom_order: Markov order for GraphIDyOM model (default: 2)
+        """
         results = {}
         models = {}
         
@@ -1053,6 +1117,7 @@ class TrajectoryPredictor:
             'lstm': {'batch_size': 64, 'epochs': 50, 'learning_rate': 0.001, 'enabled': train_lstm},
             'transformer': {'batch_size': 32, 'epochs': 50, 'learning_rate': 0.0001, 'enabled': train_transformer},
             'gnn': {'batch_size': 32, 'epochs': 50, 'learning_rate': 0.001, 'enabled': train_gnn},
+            'graphidyom': {'batch_size': 128, 'epochs': 50, 'learning_rate': 0.0005, 'enabled': train_graphidyom}
         }
         
         for model_type, config in model_configs.items():
@@ -1074,7 +1139,7 @@ class TrajectoryPredictor:
             if use_kfold:
                 # Train with K-Fold cross-validation
                 fold_results, model, aggregated_metrics = self.train_model_kfold(
-                    model_type=model_type, k_folds=k_folds, **train_config
+                    model_type=model_type, k_folds=k_folds, graphidyom_order=graphidyom_order, **train_config
                 )
                 
                 # Evaluate full path prediction using best model
@@ -1092,7 +1157,7 @@ class TrajectoryPredictor:
             else:
                 # Train model with simple train/val/test split
                 model, train_losses, val_losses, val_accuracies = self.train_model(
-                    model_type=model_type, **train_config
+                    model_type=model_type, graphidyom_order=graphidyom_order, **train_config
                 )
                 
                 # Evaluate model (next-step prediction)
@@ -1124,9 +1189,6 @@ class TrajectoryPredictor:
             print(f"\nLoading existing results from {json_file_path}...")
             with open(json_file_path, 'r') as f:
                 comparison_results = json.load(f)
-            comparison_results.get('models', {}).pop('graphidyom', None)
-            experiment_info = comparison_results.get('experiment_info', {})
-            experiment_info.get('models_trained', {}).pop('graphidyom', None)
             print(f"Existing models found: {list(comparison_results.get('models', {}).keys())}")
         else:
             # Create new results structure
@@ -1142,7 +1204,8 @@ class TrajectoryPredictor:
                     'models_trained': {
                         'lstm': train_lstm,
                         'transformer': train_transformer,
-                        'gnn': train_gnn
+                        'gnn': train_gnn,
+                        'graphidyom': train_graphidyom
                     }
                 },
                 'models': {}
@@ -1156,7 +1219,8 @@ class TrajectoryPredictor:
             comparison_results['experiment_info']['models_trained'] = {
                 'lstm': train_lstm,
                 'transformer': train_transformer,
-                'gnn': train_gnn
+                'gnn': train_gnn,
+                'graphidyom': train_graphidyom
             }
         
         # Add/update results for trained models
@@ -1198,7 +1262,7 @@ def main():
     """Main training function"""
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train trajectory prediction models')
-    parser.add_argument('--model', type=str, choices=['lstm', 'transformer', 'gnn', 'all'], 
+    parser.add_argument('--model', type=str, choices=['lstm', 'transformer', 'gnn', 'graphidyom', 'all'], 
                        default='all', help='Model type to train (default: all)')
     parser.add_argument('--data-path', type=str, default="data/subnet_ci.csv",
                        help='Path to training data CSV file')
@@ -1220,6 +1284,8 @@ def main():
                        help='Disable K-Fold cross-validation')
     parser.add_argument('--k-folds', type=int, default=None,
                        help=f'Number of folds for K-Fold CV (default: {K_FOLDS})')
+    parser.add_argument('--graphidyom-order', type=int, default=7,
+                       help='Markov order for GraphIDyOM model (default: 7)')
     
     args = parser.parse_args()
     
@@ -1265,6 +1331,7 @@ def main():
         print(f"  TRAIN_LSTM: {TRAIN_LSTM}")
         print(f"  TRAIN_TRANSFORMER: {TRAIN_TRANSFORMER}")
         print(f"  TRAIN_GNN: {TRAIN_GNN}")
+        print(f"  TRAIN_GRAPHIDYOM: {TRAIN_GRAPHIDYOM}")
         print(f"  USE_KFOLD: {use_kfold}")
         if use_kfold:
             print(f"  K_FOLDS: {k_folds}")
@@ -1273,8 +1340,10 @@ def main():
             train_lstm=TRAIN_LSTM,
             train_transformer=TRAIN_TRANSFORMER,
             train_gnn=TRAIN_GNN,
+            train_graphidyom=TRAIN_GRAPHIDYOM,
             use_kfold=use_kfold,
-            k_folds=k_folds
+            k_folds=k_folds,
+            graphidyom_order=args.graphidyom_order
         )
         
         if results:
@@ -1323,7 +1392,8 @@ def main():
         model_configs = {
             'lstm': {'batch_size': args.batch_size, 'epochs': args.epochs, 'learning_rate': args.learning_rate},
             'transformer': {'batch_size': min(args.batch_size, 32), 'epochs': args.epochs, 'learning_rate': max(args.learning_rate * 0.1, 0.0001)},
-            'gnn': {'batch_size': min(args.batch_size, 32), 'epochs': args.epochs, 'learning_rate': args.learning_rate}
+            'gnn': {'batch_size': min(args.batch_size, 32), 'epochs': args.epochs, 'learning_rate': args.learning_rate},
+            'graphidyom': {'batch_size': args.batch_size, 'epochs': args.epochs, 'learning_rate': args.learning_rate}
         }
         
         config = model_configs.get(args.model, model_configs['lstm'])
@@ -1331,7 +1401,7 @@ def main():
         if use_kfold:
             # Train with K-Fold cross-validation
             fold_results, model, aggregated_metrics = predictor.train_model_kfold(
-                model_type=args.model, k_folds=k_folds, **config
+                model_type=args.model, k_folds=k_folds, graphidyom_order=args.graphidyom_order, **config
             )
             
             # Evaluate full path prediction (autoregressive)
@@ -1350,7 +1420,7 @@ def main():
         else:
             # Train model with simple split
             model, train_losses, val_losses, val_accuracies = predictor.train_model(
-                model_type=args.model, **config
+                model_type=args.model, graphidyom_order=args.graphidyom_order, **config
             )
             
             # Evaluate model (next-step)
